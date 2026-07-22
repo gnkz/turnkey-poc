@@ -13,7 +13,6 @@ import {
   useState,
 } from "react";
 import {
-  formatUnits,
   getAddress,
   isAddress,
   maxUint256,
@@ -22,7 +21,6 @@ import {
 
 import {
   CONTRACTS,
-  erc20Abi,
   ETHEREUM_CAIP2,
   ETHEREUM_CHAIN_ID,
   psmWrapperAbi,
@@ -45,6 +43,10 @@ import {
   maximumGasCost,
   resolveNonSponsoredBatchGasLimit,
 } from "@/lib/gas";
+import {
+  skyConversion,
+  type SkyConversionOverview,
+} from "@/lib/sky-conversion";
 
 const SPONSOR_TRANSACTIONS =
   process.env.NEXT_PUBLIC_TURNKEY_SPONSOR_TRANSACTIONS === "true";
@@ -56,8 +58,6 @@ const NON_SPONSORED_BATCH_GAS_LIMIT = resolveNonSponsoredBatchGasLimit(
 
 type ProtocolSnapshot = {
   owner: Address;
-  usdcBalance: bigint;
-  susdsBalance: bigint;
   ethBalance: bigint;
   tin: bigint;
   tout: bigint;
@@ -98,16 +98,6 @@ function formatError(error: unknown): string {
 
 function shortenAddress(address: string, size = 5): string {
   return `${address.slice(0, size + 2)}...${address.slice(-size)}`;
-}
-
-function formatPercent(rate: bigint): string {
-  if (rate === maxUint256) return "Halted";
-  const basisPoints = (rate * 10_000n) / 10n ** 18n;
-  return `${(Number(basisPoints) / 100).toFixed(2)}%`;
-}
-
-function exactBalance(balance: bigint, decimals: number): string {
-  return formatUnits(balance, decimals).replace(/\.0+$/, "");
 }
 
 function TokenMark({ token }: { token: "USDC" | "USDS" | "sUSDS" }) {
@@ -259,6 +249,11 @@ export function Converter() {
   const [direction, setDirection] = useState<Direction>("deposit");
   const [input, setInput] = useState("");
   const deferredInput = useDeferredValue(input);
+  const [loadedOverview, setOverview] = useState<SkyConversionOverview | null>(
+    null,
+  );
+  const [overviewError, setOverviewError] = useState<string | null>(null);
+  const [overviewLoading, setOverviewLoading] = useState(false);
   const [loadedSnapshot, setSnapshot] = useState<ProtocolSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
@@ -282,6 +277,40 @@ export function Converter() {
       : null;
   const snapshot =
     loadedSnapshot?.owner === accountAddress ? loadedSnapshot : null;
+  const overview =
+    loadedOverview?.walletAddress === accountAddress ? loadedOverview : null;
+
+  useEffect(() => {
+    if (!accountAddress) return;
+
+    const address = accountAddress;
+    const controller = new AbortController();
+    let cancelled = false;
+
+    async function loadOverview() {
+      setOverviewLoading(true);
+      setOverviewError(null);
+      try {
+        const nextOverview = await skyConversion.getOverview(address, {
+          signal: controller.signal,
+        });
+        if (!cancelled) setOverview(nextOverview);
+      } catch (error) {
+        if (!cancelled) {
+          setOverview(null);
+          setOverviewError(formatError(error));
+        }
+      } finally {
+        if (!cancelled) setOverviewLoading(false);
+      }
+    }
+
+    void loadOverview();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [accountAddress, refreshKey]);
 
   useEffect(() => {
     if (!accountAddress) return;
@@ -295,26 +324,12 @@ export function Converter() {
       try {
         const [
           chainId,
-          usdcBalance,
-          susdsBalance,
           ethBalance,
           tin,
           tout,
           live,
         ] = await Promise.all([
           ethereumClient.getChainId(),
-          ethereumClient.readContract({
-            address: CONTRACTS.usdc,
-            abi: erc20Abi,
-            functionName: "balanceOf",
-            args: [address],
-          }),
-          ethereumClient.readContract({
-            address: CONTRACTS.susds,
-            abi: erc20Abi,
-            functionName: "balanceOf",
-            args: [address],
-          }),
           ethereumClient.getBalance({ address }),
           ethereumClient.readContract({
             address: CONTRACTS.usdsPsmWrapper,
@@ -342,8 +357,6 @@ export function Converter() {
         if (!cancelled) {
           setSnapshot({
             owner: address,
-            usdcBalance,
-            susdsBalance,
             ethBalance,
             tin,
             tout,
@@ -473,13 +486,23 @@ export function Converter() {
     quoteState?.input === input && quoteState.direction === direction;
   const quote = snapshot && quoteIsCurrent ? quoteState.quote : null;
   const inputDecimals = direction === "deposit" ? 6 : 18;
-  const inputToken = direction === "deposit" ? "USDC" : "sUSDS";
-  const outputToken = direction === "deposit" ? "sUSDS" : "USDC";
-  const inputBalance = snapshot
+  const directionOverview = overview
     ? direction === "deposit"
-      ? snapshot.usdcBalance
-      : snapshot.susdsBalance
-    : 0n;
+      ? overview.directions.usdcToSusds
+      : overview.directions.susdsToUsdc
+    : null;
+  const inputToken =
+    directionOverview?.inputAsset ??
+    (direction === "deposit" ? "USDC" : "sUSDS");
+  const outputToken =
+    directionOverview?.outputAsset ??
+    (direction === "deposit" ? "sUSDS" : "USDC");
+  const inputBalance = directionOverview
+    ? parseTokenAmount(
+        directionOverview.inputBalance.useMaxText,
+        inputDecimals,
+      )
+    : null;
   const calls =
     quote && accountAddress
       ? quote.direction === "deposit"
@@ -496,14 +519,10 @@ export function Converter() {
           })
       : [];
 
-  const insufficientBalance = quote
-    ? quote.inputAmount > inputBalance
-    : false;
+  const insufficientBalance =
+    quote && inputBalance !== null ? quote.inputAmount > inputBalance : false;
   const outputTooSmall = quote ? quote.outputAmount === 0n : false;
-  const psmHalted = snapshot
-    ? snapshot.live !== 1n ||
-      (direction === "deposit" ? snapshot.tin : snapshot.tout) === maxUint256
-    : false;
+  const psmHalted = directionOverview?.availability.status === "halted";
   const missingGas = snapshot
     ? !SPONSOR_TRANSACTIONS && snapshot.ethBalance === 0n
     : false;
@@ -511,7 +530,9 @@ export function Converter() {
   let actionLabel = "Enter an amount";
   let actionDisabled = true;
 
-  if (input && (quoteLoading || !quoteIsCurrent)) {
+  if (psmHalted) {
+    actionLabel = directionOverview.availability.message;
+  } else if (input && (quoteLoading || !quoteIsCurrent)) {
     actionLabel = "Updating quote...";
   } else if (quoteError) {
     actionLabel = "Quote unavailable";
@@ -519,13 +540,15 @@ export function Converter() {
     actionLabel = `Insufficient ${inputToken}`;
   } else if (outputTooSmall) {
     actionLabel = "Amount is too small";
-  } else if (psmHalted) {
-    actionLabel = "Sky conversion is halted";
+  } else if (quote && !directionOverview) {
+    actionLabel = overviewLoading
+      ? "Loading wallet overview..."
+      : "Sky Conversion unavailable";
   } else if (missingGas) {
     actionLabel = "Wallet needs ETH for gas";
   } else if (!MAINNET_TRANSACTIONS_ENABLED && quote) {
     actionLabel = "Mainnet submission is locked";
-  } else if (quote && calls.length > 0) {
+  } else if (quote && calls.length > 0 && directionOverview) {
     actionLabel = `Review ${calls.length}-call batch`;
     actionDisabled = false;
   }
@@ -721,7 +744,7 @@ export function Converter() {
               <h2>USDC / sUSDS</h2>
               <span className="batch-chip">Mainnet</span>
             </div>
-            <p>Create the Ethereum account used by this swap.</p>
+            <p>Create the Ethereum account used for this Sky Conversion.</p>
             {walletError ? (
               <p className="inline-error" role="alert">
                 {walletError}
@@ -748,9 +771,9 @@ export function Converter() {
                 <label htmlFor="token-amount">You send</label>
                 <span>
                   Balance{" "}
-                  {snapshotLoading
+                  {overviewLoading
                     ? "..."
-                    : formatTokenAmount(inputBalance, inputDecimals, 6)}
+                    : (directionOverview?.inputBalance.displayText ?? "--")}
                 </span>
               </div>
               <div className="amount-row">
@@ -772,8 +795,14 @@ export function Converter() {
               </div>
               <button
                 className="max-button"
-                disabled={!snapshot || inputBalance === 0n}
-                onClick={() => setInput(exactBalance(inputBalance, inputDecimals))}
+                disabled={
+                  overviewLoading || !directionOverview?.inputBalance.canUseMax
+                }
+                onClick={() => {
+                  if (directionOverview) {
+                    setInput(directionOverview.inputBalance.useMaxText);
+                  }
+                }}
                 type="button"
               >
                 Use max
@@ -816,13 +845,9 @@ export function Converter() {
 
             <div className="quote-details">
               <div>
-                <span>Sky conversion fee</span>
+                <span>Sky Conversion fee</span>
                 <strong>
-                  {snapshot
-                    ? formatPercent(
-                        direction === "deposit" ? snapshot.tin : snapshot.tout,
-                      )
-                    : "--"}
+                  {directionOverview?.fee.displayText ?? "--"}
                 </strong>
               </div>
               <div>
@@ -839,9 +864,9 @@ export function Converter() {
               ) : null}
             </div>
 
-            {snapshotError || quoteError ? (
+            {overviewError || snapshotError || quoteError ? (
               <p className="inline-error" role="alert">
-                {snapshotError ?? quoteError}
+                {overviewError ?? snapshotError ?? quoteError}
               </p>
             ) : null}
 
@@ -855,7 +880,7 @@ export function Converter() {
 
             <button
               className="primary-button convert-button"
-              disabled={actionDisabled || snapshotLoading}
+              disabled={actionDisabled || overviewLoading || snapshotLoading}
               onClick={() => {
                 setSubmission({ phase: "idle" });
                 setReviewOpen(true);

@@ -12,6 +12,11 @@ export const skyConversion = createSkyConversion(ethereumReader);
 export { SkyConversionFailure } from "./failure";
 export type { SkyConversionFailureCode } from "./failure";
 export type {
+  ConversionPlan,
+  ConversionPlanCall,
+  ConversionPlanCallMeaning,
+  ConversionPlanIneligibilityReason,
+  ConversionPlanPreparation,
   SkyConversion,
   SkyConversionAsset,
   SkyConversionDirection,

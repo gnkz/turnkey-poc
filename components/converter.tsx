@@ -27,12 +27,10 @@ import {
   susdsAbi,
 } from "@/lib/contracts";
 import {
-  buildDepositCalls,
   buildRedeemCalls,
   formatTokenAmount,
   maxUsdcForUsds,
   parseTokenAmount,
-  quoteUsdcToUsds,
   usdsRequiredForUsdc,
   type ConversionQuote,
   type Direction,
@@ -45,6 +43,9 @@ import {
 } from "@/lib/gas";
 import {
   skyConversion,
+  type ConversionPlan,
+  type ConversionPlanCallMeaning,
+  type ConversionPlanPreparation,
   type SkyConversionOverview,
 } from "@/lib/sky-conversion";
 
@@ -56,18 +57,30 @@ const NON_SPONSORED_BATCH_GAS_LIMIT = resolveNonSponsoredBatchGasLimit(
   process.env.NEXT_PUBLIC_NON_SPONSORED_BATCH_GAS_LIMIT,
 );
 
-type ProtocolSnapshot = {
-  owner: Address;
-  ethBalance: bigint;
-  tin: bigint;
-  tout: bigint;
-  live: bigint;
-};
+type ProtocolSnapshot =
+  | {
+      owner: Address;
+      direction: "deposit";
+      ethBalance: bigint;
+    }
+  | {
+      owner: Address;
+      direction: "redeem";
+      ethBalance: bigint;
+      tout: bigint;
+      live: bigint;
+    };
 
 type QuoteState = {
   direction: Direction;
   input: string;
   quote: ConversionQuote;
+};
+
+type UsdcToSusdsPlanState = {
+  owner: Address;
+  input: string;
+  preparation: ConversionPlanPreparation;
 };
 
 type Submission =
@@ -127,17 +140,25 @@ function CopyIcon() {
 
 function BatchReview({
   calls,
+  callMeanings,
   direction,
+  feeLabel,
   inputLabel,
+  networkLabel,
   outputLabel,
+  atomicityText,
   onCancel,
   onConfirm,
   submission,
 }: {
-  calls: TurnkeyCall[];
+  calls: readonly TurnkeyCall[];
+  callMeanings?: readonly ConversionPlanCallMeaning[];
   direction: Direction;
+  feeLabel?: string;
   inputLabel: string;
+  networkLabel?: string;
   outputLabel: string;
+  atomicityText?: string;
   onCancel: () => void;
   onConfirm: () => void;
   submission: Submission;
@@ -184,17 +205,41 @@ function BatchReview({
         </div>
 
         <div className="review-call-list">
-          {calls.map((_, index) => (
-            <div className="review-call" key={steps[index]}>
-              <span className="step-index">{index + 1}</span>
-              <strong>{steps[index]}</strong>
-            </div>
-          ))}
+          {calls.map((call, index) => {
+            const meaning = callMeanings?.[index];
+            return (
+              <div className="review-call" key={`${call.to}-${index}`}>
+                <span className="step-index">{index + 1}</span>
+                <div className="review-call-body">
+                  <strong>{meaning?.title ?? steps[index]}</strong>
+                  {meaning ? (
+                    <>
+                      <span className="review-call-target">
+                        {meaning.targetName}
+                        <code title={meaning.targetAddress}>
+                          {meaning.targetAddress}
+                        </code>
+                      </span>
+                      <span className="review-call-selector">
+                        Selector <code>{meaning.selector}</code>
+                      </span>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
         <div className="review-network">
+          {feeLabel ? (
+            <>
+              <span>Sky fee</span>
+              <strong>{feeLabel}</strong>
+            </>
+          ) : null}
           <span>Network</span>
-          <strong>Ethereum mainnet</strong>
+          <strong>{networkLabel ?? "Ethereum mainnet"}</strong>
           <span>Gas</span>
           <strong>
             {SPONSOR_TRANSACTIONS ? "Sponsored by Turnkey" : "Paid by wallet"}
@@ -226,8 +271,8 @@ function BatchReview({
               : `Confirm ${calls.length} calls`}
         </button>
         <p className="review-footnote">
-          Calls execute in order. If any call fails, the entire EIP-7702 batch
-          reverts.
+          {atomicityText ??
+            "Calls execute in order. If any call fails, the entire EIP-7702 batch reverts."}
         </p>
       </section>
     </div>
@@ -260,8 +305,14 @@ export function Converter() {
   const [quoteState, setQuoteState] = useState<QuoteState | null>(null);
   const [quoteError, setQuoteError] = useState<string | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
+  const [usdcToSusdsPlanState, setUsdcToSusdsPlanState] =
+    useState<UsdcToSusdsPlanState | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewedUsdcToSusdsPlan, setReviewedUsdcToSusdsPlan] =
+    useState<ConversionPlan | null>(null);
   const [submission, setSubmission] = useState<Submission>({ phase: "idle" });
   const [walletError, setWalletError] = useState<string | null>(null);
   const [creatingWallet, setCreatingWallet] = useState(false);
@@ -276,7 +327,10 @@ export function Converter() {
       ? getAddress(embeddedAccount.address)
       : null;
   const snapshot =
-    loadedSnapshot?.owner === accountAddress ? loadedSnapshot : null;
+    loadedSnapshot?.owner === accountAddress &&
+    loadedSnapshot.direction === direction
+      ? loadedSnapshot
+      : null;
   const overview =
     loadedOverview?.walletAddress === accountAddress ? loadedOverview : null;
 
@@ -316,36 +370,30 @@ export function Converter() {
     if (!accountAddress) return;
 
     const address = accountAddress;
+    const currentDirection = direction;
     let cancelled = false;
 
     async function loadSnapshot() {
       setSnapshotLoading(true);
       setSnapshotError(null);
       try {
-        const [
-          chainId,
-          ethBalance,
-          tin,
-          tout,
-          live,
-        ] = await Promise.all([
+        const [chainId, ethBalance, reverseRoute] = await Promise.all([
           ethereumClient.getChainId(),
           ethereumClient.getBalance({ address }),
-          ethereumClient.readContract({
-            address: CONTRACTS.usdsPsmWrapper,
-            abi: psmWrapperAbi,
-            functionName: "tin",
-          }),
-          ethereumClient.readContract({
-            address: CONTRACTS.usdsPsmWrapper,
-            abi: psmWrapperAbi,
-            functionName: "tout",
-          }),
-          ethereumClient.readContract({
-            address: CONTRACTS.usdsPsmWrapper,
-            abi: psmWrapperAbi,
-            functionName: "live",
-          }),
+          currentDirection === "redeem"
+            ? Promise.all([
+                ethereumClient.readContract({
+                  address: CONTRACTS.usdsPsmWrapper,
+                  abi: psmWrapperAbi,
+                  functionName: "tout",
+                }),
+                ethereumClient.readContract({
+                  address: CONTRACTS.usdsPsmWrapper,
+                  abi: psmWrapperAbi,
+                  functionName: "live",
+                }),
+              ])
+            : Promise.resolve(null),
         ]);
 
         if (chainId !== ETHEREUM_CHAIN_ID) {
@@ -355,13 +403,22 @@ export function Converter() {
         }
 
         if (!cancelled) {
-          setSnapshot({
-            owner: address,
-            ethBalance,
-            tin,
-            tout,
-            live,
-          });
+          if (currentDirection === "redeem" && reverseRoute) {
+            const [tout, live] = reverseRoute;
+            setSnapshot({
+              owner: address,
+              direction: "redeem",
+              ethBalance,
+              tout,
+              live,
+            });
+          } else {
+            setSnapshot({
+              owner: address,
+              direction: "deposit",
+              ethBalance,
+            });
+          }
         }
       } catch (error) {
         if (!cancelled) {
@@ -377,10 +434,60 @@ export function Converter() {
     return () => {
       cancelled = true;
     };
-  }, [accountAddress, refreshKey]);
+  }, [accountAddress, direction, refreshKey]);
 
   useEffect(() => {
-    if (!snapshot || !accountAddress) return;
+    if (!accountAddress || direction !== "deposit") return;
+
+    const address = accountAddress;
+    const controller = new AbortController();
+    let cancelled = false;
+
+    async function loadPlan() {
+      setPlanLoading(true);
+      setPlanError(null);
+      try {
+        const preparation = await skyConversion.prepareConversionPlan(
+          {
+            walletAddress: address,
+            direction: "usdc-to-susds",
+            amount: deferredInput,
+          },
+          { signal: controller.signal },
+        );
+        if (!cancelled) {
+          setUsdcToSusdsPlanState({
+            owner: address,
+            input: deferredInput,
+            preparation,
+          });
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setUsdcToSusdsPlanState(null);
+          setPlanError(formatError(error));
+        }
+      } finally {
+        if (!cancelled) setPlanLoading(false);
+      }
+    }
+
+    void loadPlan();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [accountAddress, deferredInput, direction, refreshKey]);
+
+  useEffect(() => {
+    if (
+      !snapshot ||
+      snapshot.direction !== "redeem" ||
+      !accountAddress ||
+      direction !== "redeem"
+    ) {
+      return;
+    }
 
     const currentSnapshot = snapshot;
     let cancelled = false;
@@ -388,17 +495,15 @@ export function Converter() {
     async function loadQuote() {
       setQuoteError(null);
       try {
-        const routeFee =
-          direction === "deposit"
-            ? currentSnapshot.tin
-            : currentSnapshot.tout;
-        if (currentSnapshot.live !== 1n || routeFee === maxUint256) {
+        if (
+          currentSnapshot.live !== 1n ||
+          currentSnapshot.tout === maxUint256
+        ) {
           setQuoteState(null);
           return;
         }
 
-        const decimals = direction === "deposit" ? 6 : 18;
-        const inputAmount = parseTokenAmount(deferredInput, decimals);
+        const inputAmount = parseTokenAmount(deferredInput, 18);
 
         if (inputAmount === 0n) {
           if (!cancelled) {
@@ -410,61 +515,34 @@ export function Converter() {
 
         setQuoteLoading(true);
 
-        if (direction === "deposit") {
-          const { usdsAmount, feeAmount } = quoteUsdcToUsds(
-            inputAmount,
-            currentSnapshot.tin,
-          );
-          const outputAmount = await ethereumClient.readContract({
-            address: CONTRACTS.susds,
-            abi: susdsAbi,
-            functionName: "previewDeposit",
-            args: [usdsAmount],
-          });
+        const usdsAmount = await ethereumClient.readContract({
+          address: CONTRACTS.susds,
+          abi: susdsAbi,
+          functionName: "previewRedeem",
+          args: [inputAmount],
+        });
+        const outputAmount = maxUsdcForUsds(
+          usdsAmount,
+          currentSnapshot.tout,
+        );
+        const usdsRequired = usdsRequiredForUsdc(
+          outputAmount,
+          currentSnapshot.tout,
+        );
 
-          if (!cancelled) {
-            setQuoteState({
-              direction,
-              input: deferredInput,
-              quote: {
-                direction,
-                inputAmount,
-                usdsAmount,
-                outputAmount,
-                feeAmount,
-              },
-            });
-          }
-        } else {
-          const usdsAmount = await ethereumClient.readContract({
-            address: CONTRACTS.susds,
-            abi: susdsAbi,
-            functionName: "previewRedeem",
-            args: [inputAmount],
+        if (!cancelled) {
+          setQuoteState({
+            direction: "redeem",
+            input: deferredInput,
+            quote: {
+              direction: "redeem",
+              inputAmount,
+              usdsAmount,
+              usdsRequired,
+              outputAmount,
+              dustAmount: usdsAmount - usdsRequired,
+            },
           });
-          const outputAmount = maxUsdcForUsds(
-            usdsAmount,
-            currentSnapshot.tout,
-          );
-          const usdsRequired = usdsRequiredForUsdc(
-            outputAmount,
-            currentSnapshot.tout,
-          );
-
-          if (!cancelled) {
-            setQuoteState({
-              direction,
-              input: deferredInput,
-              quote: {
-                direction,
-                inputAmount,
-                usdsAmount,
-                usdsRequired,
-                outputAmount,
-                dustAmount: usdsAmount - usdsRequired,
-              },
-            });
-          }
         }
       } catch (error) {
         if (!cancelled) {
@@ -484,7 +562,21 @@ export function Converter() {
 
   const quoteIsCurrent =
     quoteState?.input === input && quoteState.direction === direction;
-  const quote = snapshot && quoteIsCurrent ? quoteState.quote : null;
+  const quote =
+    snapshot && quoteIsCurrent && quoteState.quote.direction === "redeem"
+      ? quoteState.quote
+      : null;
+  const usdcToSusdsPreparationIsCurrent =
+    direction === "deposit" &&
+    usdcToSusdsPlanState?.owner === accountAddress &&
+    usdcToSusdsPlanState.input === input;
+  const usdcToSusdsPreparation = usdcToSusdsPreparationIsCurrent
+    ? usdcToSusdsPlanState.preparation
+    : null;
+  const usdcToSusdsPlan =
+    usdcToSusdsPreparation?.status === "ready"
+      ? usdcToSusdsPreparation.plan
+      : null;
   const inputDecimals = direction === "deposit" ? 6 : 18;
   const directionOverview = overview
     ? direction === "deposit"
@@ -505,24 +597,20 @@ export function Converter() {
     : null;
   const calls =
     quote && accountAddress
-      ? quote.direction === "deposit"
-        ? buildDepositCalls({
-            owner: accountAddress,
-            usdcAmount: quote.inputAmount,
-            usdsAmount: quote.usdsAmount,
-          })
-        : buildRedeemCalls({
-            owner: accountAddress,
-            susdsAmount: quote.inputAmount,
-            usdsRequired: quote.usdsRequired,
-            usdcAmount: quote.outputAmount,
-          })
+      ? buildRedeemCalls({
+          owner: accountAddress,
+          susdsAmount: quote.inputAmount,
+          usdsRequired: quote.usdsRequired,
+          usdcAmount: quote.outputAmount,
+        })
       : [];
 
   const insufficientBalance =
     quote && inputBalance !== null ? quote.inputAmount > inputBalance : false;
   const outputTooSmall = quote ? quote.outputAmount === 0n : false;
-  const psmHalted = directionOverview?.availability.status === "halted";
+  const psmHalted =
+    direction === "redeem" &&
+    directionOverview?.availability.status === "halted";
   const missingGas = snapshot
     ? !SPONSOR_TRANSACTIONS && snapshot.ethBalance === 0n
     : false;
@@ -530,7 +618,30 @@ export function Converter() {
   let actionLabel = "Enter an amount";
   let actionDisabled = true;
 
-  if (psmHalted) {
+  if (direction === "deposit") {
+    if (input && (planLoading || !usdcToSusdsPreparationIsCurrent)) {
+      actionLabel = "Updating Conversion Plan...";
+    } else if (planError) {
+      actionLabel = "Conversion Plan unavailable";
+    } else if (usdcToSusdsPreparation?.status === "ineligible") {
+      actionLabel = usdcToSusdsPreparation.message;
+    } else if (usdcToSusdsPlan && !directionOverview) {
+      actionLabel = overviewLoading
+        ? "Loading wallet overview..."
+        : "Sky Conversion unavailable";
+    } else if (usdcToSusdsPlan && !snapshot) {
+      actionLabel = snapshotLoading
+        ? "Loading transaction setup..."
+        : "Transaction setup unavailable";
+    } else if (missingGas) {
+      actionLabel = "Wallet needs ETH for gas";
+    } else if (!MAINNET_TRANSACTIONS_ENABLED && usdcToSusdsPlan) {
+      actionLabel = "Mainnet submission is locked";
+    } else if (usdcToSusdsPlan && directionOverview) {
+      actionLabel = "Review Conversion Plan";
+      actionDisabled = false;
+    }
+  } else if (psmHalted) {
     actionLabel = directionOverview.availability.message;
   } else if (input && (quoteLoading || !quoteIsCurrent)) {
     actionLabel = "Updating quote...";
@@ -553,16 +664,16 @@ export function Converter() {
     actionDisabled = false;
   }
 
-  const outputLabel = quote
-    ? `${formatTokenAmount(
-        quote.outputAmount,
-        direction === "deposit" ? 18 : 6,
-        6,
-      )} ${outputToken}`
-    : `-- ${outputToken}`;
-  const inputLabel = quote
-    ? `${formatTokenAmount(quote.inputAmount, inputDecimals, inputDecimals)} ${inputToken}`
-    : `0 ${inputToken}`;
+  const outputLabel = usdcToSusdsPlan
+    ? usdcToSusdsPlan.quote.estimatedReceipt.displayText
+    : quote
+      ? `${formatTokenAmount(quote.outputAmount, 6, 6)} ${outputToken}`
+      : `-- ${outputToken}`;
+  const inputLabel = usdcToSusdsPlan
+    ? usdcToSusdsPlan.quote.send.displayText
+    : quote
+      ? `${formatTokenAmount(quote.inputAmount, inputDecimals, inputDecimals)} ${inputToken}`
+      : `0 ${inputToken}`;
 
   function flipDirection() {
     startTransition(() => {
@@ -571,6 +682,7 @@ export function Converter() {
       );
       setInput("");
       setQuoteState(null);
+      setReviewedUsdcToSusdsPlan(null);
       setSubmission({ phase: "idle" });
     });
   }
@@ -591,7 +703,20 @@ export function Converter() {
   }
 
   async function submitBatch() {
-    if (!accountAddress || calls.length === 0 || !quote) return;
+    const from = reviewedUsdcToSusdsPlan?.walletAddress ?? accountAddress;
+    const submittedCalls = reviewedUsdcToSusdsPlan
+      ? reviewedUsdcToSusdsPlan.execution.calls
+      : calls;
+    if (
+      !from ||
+      submittedCalls.length === 0 ||
+      (!reviewedUsdcToSusdsPlan && !quote)
+    ) {
+      return;
+    }
+
+    // Turnkey types the call list as mutable; keep the reviewed frozen array unchanged.
+    const turnkeyCalls = submittedCalls as unknown as TurnkeyCall[];
 
     try {
       setSubmission({ phase: "submitting" });
@@ -600,7 +725,7 @@ export function Converter() {
         : await (async () => {
             const [fees, currentEthBalance] = await Promise.all([
               ethereumClient.estimateFeesPerGas({ type: "eip1559" }),
-              ethereumClient.getBalance({ address: accountAddress }),
+              ethereumClient.getBalance({ address: from }),
             ]);
             const requiredBalance = maximumGasCost(
               NON_SPONSORED_BATCH_GAS_LIMIT,
@@ -622,10 +747,11 @@ export function Converter() {
 
       const statusId = await ethSendTransaction({
         transaction: {
-          from: accountAddress,
-          caip2: ETHEREUM_CAIP2,
+          from,
+          caip2:
+            reviewedUsdcToSusdsPlan?.execution.network.caip2 ?? ETHEREUM_CAIP2,
           sponsor: SPONSOR_TRANSACTIONS,
-          calls,
+          calls: turnkeyCalls,
           ...feeFields,
         },
       });
@@ -646,6 +772,7 @@ export function Converter() {
 
       setSubmission({ phase: "success" });
       setReviewOpen(false);
+      setReviewedUsdcToSusdsPlan(null);
       setInput("");
       setRefreshKey((key) => key + 1);
     } catch (error) {
@@ -783,6 +910,7 @@ export function Converter() {
                   inputMode="decimal"
                   onChange={(event) => {
                     setInput(event.target.value);
+                    setPlanError(null);
                     setSubmission({ phase: "idle" });
                   }}
                   placeholder="0.00"
@@ -827,14 +955,22 @@ export function Converter() {
                 <span>Live vault preview</span>
               </div>
               <div className="amount-row output-row">
-                <strong className={quoteLoading ? "is-loading" : ""}>
-                  {quote
-                    ? formatTokenAmount(
-                        quote.outputAmount,
-                        direction === "deposit" ? 18 : 6,
-                        6,
-                      )
-                    : "0.00"}
+                <strong
+                  className={
+                    direction === "deposit"
+                      ? planLoading
+                        ? "is-loading"
+                        : ""
+                      : quoteLoading
+                        ? "is-loading"
+                        : ""
+                  }
+                >
+                  {usdcToSusdsPlan
+                    ? usdcToSusdsPlan.quote.estimatedReceipt.amountText
+                    : quote
+                      ? formatTokenAmount(quote.outputAmount, 6, 6)
+                      : "0.00"}
                 </strong>
                 <div className="token-select">
                   <TokenMark token={outputToken} />
@@ -847,7 +983,9 @@ export function Converter() {
               <div>
                 <span>Sky Conversion fee</span>
                 <strong>
-                  {directionOverview?.fee.displayText ?? "--"}
+                  {usdcToSusdsPlan?.quote.skyFee.displayText ??
+                    directionOverview?.fee.displayText ??
+                    "--"}
                 </strong>
               </div>
               <div>
@@ -864,9 +1002,13 @@ export function Converter() {
               ) : null}
             </div>
 
-            {overviewError || snapshotError || quoteError ? (
+            {overviewError ||
+            snapshotError ||
+            (direction === "deposit" ? planError : quoteError) ? (
               <p className="inline-error" role="alert">
-                {overviewError ?? snapshotError ?? quoteError}
+                {overviewError ??
+                  snapshotError ??
+                  (direction === "deposit" ? planError : quoteError)}
               </p>
             ) : null}
 
@@ -883,6 +1025,12 @@ export function Converter() {
               disabled={actionDisabled || overviewLoading || snapshotLoading}
               onClick={() => {
                 setSubmission({ phase: "idle" });
+                if (direction === "deposit") {
+                  if (!usdcToSusdsPlan) return;
+                  setReviewedUsdcToSusdsPlan(usdcToSusdsPlan);
+                } else {
+                  setReviewedUsdcToSusdsPlan(null);
+                }
                 setReviewOpen(true);
               }}
               type="button"
@@ -900,18 +1048,30 @@ export function Converter() {
         )}
       </section>
 
-      {reviewOpen && quote ? (
+      {reviewOpen && (reviewedUsdcToSusdsPlan || quote) ? (
         <BatchReview
-          calls={calls}
-          direction={direction}
-          inputLabel={inputLabel}
-          outputLabel={outputLabel}
+          calls={reviewedUsdcToSusdsPlan?.execution.calls ?? calls}
+          callMeanings={reviewedUsdcToSusdsPlan?.review.calls}
+          direction={reviewedUsdcToSusdsPlan ? "deposit" : direction}
+          feeLabel={reviewedUsdcToSusdsPlan?.quote.skyFee.displayText}
+          inputLabel={
+            reviewedUsdcToSusdsPlan?.quote.send.displayText ?? inputLabel
+          }
+          networkLabel={
+            reviewedUsdcToSusdsPlan?.execution.network.displayText
+          }
+          outputLabel={
+            reviewedUsdcToSusdsPlan?.quote.estimatedReceipt.displayText ??
+            outputLabel
+          }
+          atomicityText={reviewedUsdcToSusdsPlan?.review.atomicityText}
           onCancel={() => {
             if (
               submission.phase !== "submitting" &&
               submission.phase !== "polling"
             ) {
               setReviewOpen(false);
+              setReviewedUsdcToSusdsPlan(null);
             }
           }}
           onConfirm={() => void submitBatch()}

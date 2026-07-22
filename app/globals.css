@@ -464,7 +464,7 @@ code {
 }
 
 .review-call {
-  align-items: center;
+  align-items: start;
   display: grid;
   gap: 12px;
   grid-template-columns: 28px 1fr;
@@ -482,8 +482,31 @@ code {
   width: 28px;
 }
 
-.review-call strong {
+.review-call-body {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding-top: 1px;
+}
+
+.review-call-body > strong {
   font-size: 11px;
+}
+
+.review-call-target,
+.review-call-selector {
+  color: #69726d;
+  display: grid;
+  font-size: 9px;
+  gap: 3px;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.review-call-target code,
+.review-call-selector code {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .review-network {

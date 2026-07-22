@@ -1,6 +1,7 @@
 import type {
   PinnedEthereumReader,
   PinnedRawCallExecutor,
+  RawEthereumCall,
 } from "./ethereum-reader";
 
 type RecordingReadScript =
@@ -18,6 +19,7 @@ export type RecordedEthereumRead = Readonly<{
 
 export class RecordingEthereumReader implements PinnedEthereumReader {
   readonly recordedReads: RecordedEthereumRead[] = [];
+  readonly recordedCalls: (readonly (readonly RawEthereumCall[])[])[] = [];
   readonly #scripts: RecordingReadScript[];
 
   constructor(scripts: readonly RecordingReadScript[]) {
@@ -35,6 +37,7 @@ export class RecordingEthereumReader implements PinnedEthereumReader {
 
     const roundBlockNumbers: bigint[] = [];
     const callCounts: number[] = [];
+    const roundCalls: (readonly RawEthereumCall[])[] = [];
     let nextRound = 0;
     const executor: PinnedRawCallExecutor = {
       execute: async (calls) => {
@@ -50,6 +53,7 @@ export class RecordingEthereumReader implements PinnedEthereumReader {
         nextRound += 1;
         roundBlockNumbers.push(script.blockNumber);
         callCounts.push(calls.length);
+        roundCalls.push(calls.map((call) => ({ ...call })));
         return results;
       },
     };
@@ -60,6 +64,7 @@ export class RecordingEthereumReader implements PinnedEthereumReader {
       roundBlockNumbers,
       callCounts,
     });
+    this.recordedCalls.push(roundCalls);
     return result;
   }
 }
